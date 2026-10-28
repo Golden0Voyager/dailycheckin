@@ -1,0 +1,77 @@
+name: Daily Check-in
+
+# 从本机 launchd 迁移而来的每日签到（2026-10-28）。
+# 本机 launchd 版本已下线，此工作流为唯一执行入口。
+
+on:
+  schedule:
+    # GitHub 的 cron 一律按 UTC 解释，不认本地时区。
+    # 08:30 Asia/Shanghai (UTC+8) == 00:30 UTC
+    # 注意：Actions 的定时任务是 best-effort，高峰期可能延迟数十分钟甚至跳过。
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+
+# 最小权限：只需要读代码
+permissions:
+  contents: read
+
+# 防止两次运行重叠（签到接口幂等，但没必要并发）
+concurrency:
+  group: daily-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Materialize config.json
+        env:
+          # 整份 config.json 存在仓库 Secret 里，运行时落地成文件。
+          # 仓库里永远不提交 config.json（.gitignore 已忽略）。
+          CONFIG_JSON: ${{ secrets.DAILYCHECKIN_CONFIG }}
+        run: |
+          if [ -z "${CONFIG_JSON:-}" ]; then
+            echo "::error::缺少 Secret：DAILYCHECKIN_CONFIG。请在仓库 Settings → Secrets and variables → Actions 中添加，内容为本地 config.json 的全文。"
+            exit 1
+          fi
+          printf '%s' "$CONFIG_JSON" > config.json
+          chmod 600 config.json
+          python -c "import json; json.load(open('config.json')); print('config.json 解析正常')"
+
+      - name: Run check-in
+        run: |
+          set -o pipefail
+          python -m dailycheckin.main 2>&1 | tee checkin.log
+
+      - name: Report site failures
+        if: always()
+        run: |
+          if [ ! -f checkin.log ]; then
+            echo "::error::没有产生运行日志，签到脚本可能启动失败"
+            exit 1
+          fi
+          if grep -q "❌" checkin.log; then
+            echo "::error::有站点签到失败，详见上方日志"
+            exit 1
+          fi
+          echo "全部站点执行完毕，无异常标记"
+
+      - name: Wipe credentials
+        if: always()
+        run: rm -f config.json checkin.log

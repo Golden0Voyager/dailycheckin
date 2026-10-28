@@ -98,12 +98,18 @@ def message2dingtalk(dingtalk_secret, dingtalk_access_token, content):
 
 def message2bark(bark_url: str, content):
     print("Bark 推送开始")
-    if not bark_url.endswith("/"):
-        bark_url += "/"
-    content = quote_plus(content)
-    url = f"{bark_url}{content}"
-    headers = {"Content-type": "application/x-www-form-urlencoded"}
-    requests.get(url=url, headers=headers)
+    bark_url = bark_url.rstrip("/")
+    api_base, device_key = bark_url.rsplit("/", 1)
+    payload = {
+        "device_key": device_key,
+        "title": "每日签到报告",
+        "body": content,
+        "group": "dailycheckin",
+    }
+    try:
+        requests.post(url=f"{api_base}/push", json=payload, timeout=15)
+    except Exception as e:
+        print("Bark 推送失败:", e)
 
 
 def message2qywxrobot(qywx_key, content):

@@ -105,8 +105,11 @@ class BiliBili(CheckIn):
         """
         url = "https://api.bilibili.com/x/vip/privilege/receive"
         post_data = {"type": receive_type, "csrf": bili_jct}
-        ret = session.post(url=url, data=post_data).json()
-        return ret
+        resp = session.post(url=url, data=post_data)
+        try:
+            return resp.json()
+        except ValueError:
+            return {"code": -1, "message": f"空响应(HTTP {resp.status_code})，可能被风控"}
 
     @staticmethod
     def vip_manga_reward(session) -> dict:
@@ -269,7 +272,7 @@ class BiliBili(CheckIn):
         rid int 分区号
         num int 获取视频数量
         """
-        url = "https://api.bilibili.com/x/web-interface/dynamic/region?ps=" + str(num) + "&rid=" + str(rid)
+        url = "https://api.bilibili.com/x/web-interface/newlist?rid=" + str(rid) + "&ps=" + str(num) + "&pn=1"
         ret = session.get(url=url).json()
         data_list = [
             {
@@ -278,7 +281,7 @@ class BiliBili(CheckIn):
                 "title": one.get("title"),
                 "owner": one.get("owner", {}).get("name"),
             }
-            for one in ret.get("data", {}).get("archives", [])
+            for one in (ret.get("data") or {}).get("archives") or []
         ]
         return data_list
 
@@ -367,15 +370,22 @@ class BiliBili(CheckIn):
                 coin_msg = f"今日成功投币{success_count + coins_av_count}/{self.check_item.get('coin_num', 5)}个"
             else:
                 coin_msg = f"今日成功投币{coins_av_count}/{self.check_item.get('coin_num', 5)}个"
-            aid = aid_list[0].get("aid")
-            cid = aid_list[0].get("cid")
-            title = aid_list[0].get("title")
-            report_ret = self.report_task(session=session, bili_jct=bili_jct, aid=aid, cid=cid)
+            first = aid_list[0] if aid_list else {}
+            aid = first.get("aid")
+            cid = first.get("cid")
+            title = first.get("title")
+            report_ret = (
+                self.report_task(session=session, bili_jct=bili_jct, aid=aid, cid=cid)
+                if aid and cid
+                else {"code": -1}
+            )
             if report_ret.get("code") == 0:
                 report_msg = f"观看《{title}》300秒"
             else:
                 report_msg = "任务失败"
-            share_ret = self.share_task(session=session, bili_jct=bili_jct, aid=aid)
+            share_ret = (
+                self.share_task(session=session, bili_jct=bili_jct, aid=aid) if aid else {"code": -1}
+            )
             if share_ret.get("code") == 0:
                 share_msg = f"分享《{title}》成功"
             else:
