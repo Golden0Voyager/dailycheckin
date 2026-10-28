@@ -6,9 +6,11 @@ name: Daily Check-in
 on:
   schedule:
     # GitHub 的 cron 一律按 UTC 解释，不认本地时区。
-    # 08:30 Asia/Shanghai (UTC+8) == 00:30 UTC
+    # 08:30 Asia/Shanghai (UTC+8) == 00:30 UTC；12:30 == 04:30 UTC
     # 注意：Actions 的定时任务是 best-effort，高峰期可能延迟数十分钟甚至跳过。
+    # 排两个槽位，早上失手时中午自动补一次，不依赖本机自动化补跑。
     - cron: "30 0 * * *"
+    - cron: "30 4 * * *"
   workflow_dispatch:
 
 # 最小权限：只需要读代码
