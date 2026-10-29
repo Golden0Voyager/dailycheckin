@@ -37,6 +37,18 @@ class Modelscope(CheckIn):
 
     # ------------------------------------------------------------------ #
     def main(self):
+        """正常打卡：访问站点触发发放，再核对增量。"""
+        return self._run(visit=True)
+
+    def check_only(self):
+        """只读自检：不访问站点、不触发发放，只看今天到底到账了多少。
+
+        给「签到巡检」用 —— 判断依据是规则表里的 today_earned_amount，
+        而不是只看 Actions 是不是绿的（绿只代表没抛异常）。
+        """
+        return self._run(visit=False)
+
+    def _run(self, visit: bool):
         session = self._build_session()
 
         profile = self._api(session, ME_URL).get("data") or {}
@@ -46,13 +58,16 @@ class Modelscope(CheckIn):
 
         before = self._daily_snapshot(session)
 
-        # 这一步就是「签到」本身：带登录态访问站点，后端自动发放当日额度。
-        resp = session.get(TRIGGER_URL, timeout=30, allow_redirects=True)
-        if resp.status_code != 200:
-            raise RuntimeError(f"访问用量页失败 HTTP {resp.status_code}，cookie 可能过期")
-
-        after = self._daily_snapshot(session)
-        delta = after["earned"] - before["earned"]
+        if visit:
+            # 这一步就是「签到」本身：带登录态访问站点，后端自动发放当日额度。
+            resp = session.get(TRIGGER_URL, timeout=30, allow_redirects=True)
+            if resp.status_code != 200:
+                raise RuntimeError(f"访问用量页失败 HTTP {resp.status_code}，cookie 可能过期")
+            after = self._daily_snapshot(session)
+            delta = after["earned"] - before["earned"]
+        else:
+            after = before
+            delta = 0
 
         balance = (self._api(session, BALANCE_URL).get("data") or {}).get("available_balance")
 
@@ -64,18 +79,31 @@ class Modelscope(CheckIn):
                 {"name": rule.get("title") or rule.get("rule_key"), "value": f"{got}/{amount} 魔粒"}
             )
 
-        if delta > 0:
-            verdict = f"+{delta} 已到账"
-        elif after["earned"] > 0:
-            verdict = "+0（今日已发放过，重复访问不会重复加分）"
+        if visit:
+            if delta > 0:
+                verdict = f"+{delta} 已到账"
+            elif after["earned"] > 0:
+                verdict = "+0（今日已发放过，重复访问不会重复加分）"
+            else:
+                verdict = "+0（未触发发放，检查登录态是否仍有效）"
+            msg.append({"name": "本次打卡", "value": verdict})
         else:
-            verdict = "+0（未触发发放，检查登录态是否仍有效）"
-        msg.append({"name": "本次打卡", "value": verdict})
+            msg.append({"name": "自检", "value": self._self_check_verdict(after)})
+
         msg.append({"name": "今日登录合计", "value": f"{after['earned']}/{after['cap']} 魔粒"})
         if balance is not None:
             msg.append({"name": "魔粒余额", "value": f"{balance}"})
 
         return "\n".join([f"{one.get('name')}: {one.get('value')}" for one in msg])
+
+    @staticmethod
+    def _self_check_verdict(snapshot: dict) -> str:
+        earned, cap = snapshot["earned"], snapshot["cap"]
+        if cap and earned >= cap:
+            return "正常，今日额度已拿满"
+        if earned > 0:
+            return f"部分到账 {earned}/{cap}，未拿满"
+        return "异常：今日 0 发放，登录态可能已失效或工作流未跑"
 
     # ------------------------------------------------------------------ #
     def _build_session(self) -> requests.Session:
