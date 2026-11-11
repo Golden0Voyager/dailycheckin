@@ -199,5 +199,11 @@ if __name__ == "__main__":
     _data["MODELSCOPE"] = [{"cookie": _cookie}]
     _path.write_text(json.dumps(_data, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
     _path.chmod(0o600)
+
+    # 记下刷新时刻，之后就能算出「这次会话活了多久」（下次失效时用于归因）
+    from dailycheckin.modelscope.state import record_refresh
+
+    record_refresh(len(_cookie))
+
     print(f"已用 Chrome 登录态刷新 {_path}（{len(_cookie)} 字符，未回显）")
     print("别忘了把 config.json 全文更新到仓库 Secret：DAILYCHECKIN_CONFIG")

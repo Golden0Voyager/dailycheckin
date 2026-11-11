@@ -15,6 +15,8 @@ import requests
 
 from dailycheckin import CheckIn
 
+from .state import age_text
+
 BASE = "https://www.modelscope.cn"
 TRIGGER_URL = f"{BASE}/magicube/usage"
 ME_URL = f"{BASE}/openapi/v1/users/me"
@@ -51,7 +53,13 @@ class Modelscope(CheckIn):
     def _run(self, visit: bool):
         session = self._build_session()
 
-        profile = self._api(session, ME_URL).get("data") or {}
+        try:
+            profile = self._api(session, ME_URL).get("data") or {}
+        except RuntimeError as exc:
+            # 登录态出问题时最想知道「这次活了多久」—— 把会话天数拼进错误里，
+            # 巡检汇报时就能直接读到，不用再翻历史记录。
+            age = age_text()
+            raise RuntimeError(f"{exc}｜本次会话{age}" if age else str(exc)) from exc
         account = profile.get("username") or "未知"
         nickname = profile.get("nickname") or ""
         who = f"{account}（{nickname}）" if nickname else account
@@ -72,6 +80,10 @@ class Modelscope(CheckIn):
         balance = (self._api(session, BALANCE_URL).get("data") or {}).get("available_balance")
 
         msg = [{"name": "帐号信息", "value": who}]
+        if not visit:
+            age = age_text()
+            if age:
+                msg.append({"name": "登录态", "value": age})
         for rule in after["rules"]:
             amount = rule.get("amount") or 0
             got = rule.get("today_earned_amount") or 0
