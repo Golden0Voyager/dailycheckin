@@ -85,10 +85,18 @@ flowchart TB
 | 有道云笔记 | 存储空间 | 常规接口 | Cookie | 🟢 生效 |
 | 魔搭社区 | 250 魔粒 / 日 | **当天首次调用即发放，无签到接口** | `m_session_id` | 🟢 生效 + 只读自检 |
 | 秒悟 Meoo | 每日登录积分 | `GET /api/mc/entitlement/init` 的后端副作用 | 30 天一次性票据 Cookie | 🟢 生效 |
+| 腾讯 ima | 50 算力 / 日 + 满签奖励 | `refresh` 换 2h token → `get_activity_info` → `check_in` | 长期 `refresh_token` + `ima_guid` | 🟢 生效 + 只读自检 |
+| 豆包 | 每日签到额度 + 里程碑 | `campaign/v3/detail` → `landing/checkin` → `item/reward/claim` | 网页版 Cookie 整串 | ⚪ 插件就绪，**机房 IP 被风控，仅本机 launchd 执行** |
 | New API 中转站 | 签到额度 | `POST /api/user/checkin`（404/405 回退 GET） | `access_token` + `New-Api-User` | ⚪ 模板就绪，实测站点 `checkin_enabled=false` |
 | 百度网盘 | — | — | — | ⚪ 占位符，未启用 |
 
 > 配置里 `BAIDUWP` / `NEWAPI` 仍是 `xxxxxx` 占位符，会被 `check_config()` 静默过滤，日志里不出现属于正常，不是漏签。
+>
+> **豆包为什么只在本机跑**：同一个 Cookie，本机住宅 IP 直连 `detail` 接口正常返回，
+> 换到 Actions 就固定 `HTTP 200 + code=2（会话无效，无 msg）`。这不是 Cookie 过期——
+> 本地同时刻仍可用，属服务端对机房 IP / 设备环境的判定。`DOUBAO` 键已从 Secret 移除，
+> 插件代码保留（本机手动跑或住宅代理可用），但**不要让它在 Actions 里常驻**，
+> 否则每天都会把 CI 打红，真正的站点失败反而被淹掉。
 
 ### 兄弟项目（不在本仓，同属 `~/Code/auto_checkin/` 体系）
 
@@ -102,7 +110,8 @@ flowchart TB
 | `workbuddy-auto-signin`（社区项目本地部署） | WorkBuddy 积分 + Qoder CN / Intl 每日 Credits | launchd 两个 label：7 趟 / 3 趟 | 成长中心礼物需多趟收取；Qoder Intl 窗口 21:45–23:59，23:05 那趟不能删 |
 | `minimax-daily-signin` | 400 积分（第 4/7 天 1000） | launchd | 轮换型 refreshToken，刷新前必须重读磁盘上的 `auth.json` |
 | `raccoon-daily` | 商汤小浣熊 +300 / 延效 7 天 | launchd 3 趟 | 30 天 IAM JWT 无续期，到期人工重登 |
-| `ima-daily-signin` | 腾讯 ima 50 算力 / 日、周满签奖励 | launchd | 领取后 7 天有效，过期作废 |
+| `ima-daily-signin` | 腾讯 ima 50 算力 / 日、周满签奖励 | launchd 07:10 / 21:10 **+ 本仓插件（双通道）** | 领取后 7 天有效，过期作废；两通道服务端按天幂等，重复跑不会重复到账 |
+| `doubao-daily-signin` | 豆包每日额度 + 500/2000/5000 里程碑 | launchd 07:20 / 21:20（**唯一入口**） | Cookie 由本机钥匙串解密；机房 IP 会被判会话无效，不能上云 |
 
 ---
 
@@ -118,6 +127,8 @@ flowchart TB
 | `message2bark()` 重写 | 原实现把整篇报告塞进 URL path（长文本会被截断）且一站一条推送；改为 `POST /push` JSON + 固定标题 + 分组，一天一条可读报告 |
 | Bilibili 健壮性 | `dynamic/region` 返回 `data: null` 会 `AttributeError`，改用 `x/web-interface/newlist`；空响应不再直接 `.json()` 抛 `JSONDecodeError` |
 | 配置与凭据卫生 | `config.json` 权限 600、忽略 `*.bak` / `*.tmp`、备份移出仓库目录 |
+| `dailycheckin/ima/` | refreshToken 换 2h token 的三段式链路；满签格按服务端 `status=3` 判定，不锚定周日；轮换发生时报错要求更新 Secret，不静默继续 |
+| `dailycheckin/doubao/` | 详情→签到→里程碑→复核四步闭环；`idempotent` 与 `biz_error` 都按正常中间态处理；鉴权失败透出服务端原文，便于区分过期与风控 |
 
 插件机制沿用上游：`pkgutil.walk_packages` 扫子包 + `CheckIn.__subclasses__()` 反射注册。
 **配置键必须等于 `cls.__name__.upper()`** —— 这条看起来理所当然，实际上是我们踩过最安静的一个坑（见下）。
@@ -163,6 +174,10 @@ flowchart TB
 8. **`EX_CONFIG 78 + 日志零输出 = 程序根本没被 exec`**，别去查脚本逻辑。
 9. **通知要合并。** 一个站点一条推送等于一天十几条噪音，真正异常的那条反而被淹了。
 10. **服务端按天幂等，但别把「多跑几次」当重试策略。** 重复调用不重复加分，风控却比漏签贵得多。
+11. **「Cookie 有效」≠「Cookie 在云端有效」。** 豆包同一个 Cookie，本机住宅 IP 调 `detail` 正常，
+    GitHub Actions 固定 `HTTP 200 + code=2`（会话无效，无 msg）。判据很简单：
+    **把同一份凭据拿到另一条网络立刻重试**——还失败是凭据问题，只在机房失败就是环境风控。
+    这类站点别硬塞进 CI，否则天天红，真正该被看见的站点失败反而被淹掉。
 
 ---
 
