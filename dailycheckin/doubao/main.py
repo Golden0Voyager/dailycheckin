@@ -219,7 +219,13 @@ class Doubao(CheckIn):
         resp = post_resilient(api_url(DETAIL_URL), {"campaign_group_code": GROUP_CODE}, cookie)
         code = resp.get("code")
         if code in AUTH_CODES:
-            raise NeedAuthError(f"登录态失效 code={code}，请重新登录豆包并更新 cookie")
+            # 带上服务端原文：会话无效可能来自 Cookie 过期、也可能来自异地/机房 IP 风控，
+            # 两者的处置方式完全不同，不能只报一个 code 让人去重登。
+            raise NeedAuthError(
+                "登录态失效 code={} http={} msg={}（同一 Cookie 在住宅 IP 可用则为环境风控）".format(
+                    code, resp.get("http_status"), resp.get("msg") or "无返回信息"
+                )
+            )
         if code != CODE_OK or not isinstance(resp.get("data"), dict):
             raise RuntimeError("拉取活动详情失败 code={} msg={}（活动接口可能已改版）".format(code, resp.get("msg")))
         return resp["data"]
