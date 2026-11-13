@@ -13,7 +13,8 @@
 > [!NOTE]
 > 这是一份**个人自用的工程笔记**，不是通用签到框架教程。
 > 代码基座来自 [Sitoi/dailycheckin](https://github.com/Sitoi/dailycheckin)（MIT），上游支持 20+ 站点；
-> 本仓只启用其中 4 个，另外自建了 3 个 AI 平台插件，并把执行、通知、巡检整条链路重做了一遍。
+> 本仓只启用其中 4 个，另外自建了多个 AI 平台插件（Meoo / 腾讯 ima / 豆包 / WPS 灵犀），
+> 并把执行、通知、巡检整条链路重做了一遍。
 > **公开仓库里没有任何 Cookie / Token / API Key / 设备密钥**，凭据只存在于本机 `config.json` 与 GitHub Secret 中。
 
 ---
@@ -86,11 +87,13 @@ flowchart TB
 | 魔搭社区 | 250 魔粒 / 日 | **当天首次调用即发放，无签到接口** | `m_session_id` | 🟢 生效 + 只读自检 |
 | 秒悟 Meoo | 每日登录积分 | `GET /api/mc/entitlement/init` 的后端副作用 | 30 天一次性票据 Cookie | 🟢 生效 |
 | 腾讯 ima | 50 算力 / 日 + 满签奖励 | `refresh` 换 2h token → `get_activity_info` → `check_in` | 长期 `refresh_token` + `ima_guid` | 🟢 生效 + 只读自检 |
+| WPS 灵犀 | 100 智点 / 日（第 7 天 200） | `GET /tasks` → **`available` 才** `POST claim?date=` → 回查翻转 | `wps_sid` 会话 Cookie（**364 天**） | 🟢 生效 + 只读自检 |
 | 豆包 | 每日签到额度 + 里程碑 | `campaign/v3/detail` → `landing/checkin` → `item/reward/claim` | 网页版 Cookie 整串 | ⚪ 插件就绪，**机房 IP 被风控，仅本机 launchd 执行** |
 | New API 中转站 | 签到额度 | `POST /api/user/checkin`（404/405 回退 GET） | `access_token` + `New-Api-User` | ⚪ 模板就绪，实测站点 `checkin_enabled=false` |
 | 百度网盘 | — | — | — | ⚪ 占位符，未启用 |
 
 > 配置里 `BAIDUWP` / `NEWAPI` 仍是 `xxxxxx` 占位符，会被 `check_config()` 静默过滤，日志里不出现属于正常，不是漏签。
+> 当前 Secret 共 10 个站点键，**实际生效 8 个**（2 个占位符）；`DOUBAO` 不在 Secret 里（见下方说明）。
 >
 > **豆包为什么只在本机跑**：同一个 Cookie，本机住宅 IP 直连 `detail` 接口正常返回，
 > 换到 Actions 就固定 `HTTP 200 + code=2（会话无效，无 msg）`。这不是 Cookie 过期——
@@ -149,7 +152,7 @@ flowchart TB
 
 | 手段 | 兜住什么 |
 | :--- | :--- |
-| 执行清单硬检查 | 巡检必须看到 `「秒悟Meoo积分」账号数 : 1`，缺失即判「Secret 未更新」而不是「今天通过」 |
+| 执行清单硬检查 | 巡检必须看到 `「秒悟Meoo积分」账号数 : 1`、`「腾讯ima算力」账号数 : 1`、`「WPS灵犀签到」账号数 : 1`，任一缺失即判「Secret 未更新」而不是「今天通过」 |
 | 只读 `check_only()`（仅魔搭） | 用规则表的累计发放额 `today_earned_amount` 验收；**绝不能用余额**——短期魔粒 24 小时过期，今天 +250、昨天那批同时到期，余额可能从 342 掉到 329 |
 | 两个巡检自动任务 | 09:30 查 Actions 最近 3 天 + 工作流停用自愈 + 魔粒自检；14:30 查本机 launchd 日志 mtime 与 `needs_attention` |
 | 工作流停用自愈 | 仓库 60 天无活动会被 GitHub 置为 `disabled_inactivity`，自动 `PUT .../enable` 重新启用 |
@@ -178,6 +181,14 @@ flowchart TB
     GitHub Actions 固定 `HTTP 200 + code=2`（会话无效，无 msg）。判据很简单：
     **把同一份凭据拿到另一条网络立刻重试**——还失败是凭据问题，只在机房失败就是环境风控。
     这类站点别硬塞进 CI，否则天天红，真正该被看见的站点失败反而被淹掉。
+12. **上云前先做一次「只读云端探测」，别靠猜。** 灵犀与豆包恰好是反例：同一个
+    `dailycheckin` 仓、同一类 Cookie 凭据，灵犀在 Actions 上 `GET /tasks` 直接
+    `HTTP 200 / result=ok`，豆包则被判会话无效。探测要放在临时 workflow 里只发 GET、
+    不打印响应体与凭据，跑完立刻删分支 / Secret；注意 `gh workflow run` 只认**默认分支**上的 workflow。
+13. **幂等没被验证过的写接口，必须先查再领。** 灵犀 `status=claimed` 时再 POST 就是碰风控，
+    所以插件只在 `available` 时打一次 claim、不重试，领完再回查状态是否翻转。
+    另外两个容易报错的地方：`date` 要按**北京时间**（runner 是 UTC），
+    `total_claimed_credits` 是 7 天周期累计（第 3 天返回 300），不是当日额度。
 
 ---
 
