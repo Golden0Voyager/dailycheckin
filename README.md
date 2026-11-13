@@ -113,7 +113,7 @@ flowchart TB
 | `workbuddy-auto-signin`（社区项目本地部署） | WorkBuddy 积分 + Qoder CN / Intl 每日 Credits | launchd 两个 label：7 趟 / 3 趟 | 成长中心礼物需多趟收取；Qoder Intl 窗口 21:45–23:59，23:05 那趟不能删 |
 | `minimax-daily-signin` | 400 积分（第 4/7 天 1000） | launchd | 轮换型 refreshToken，刷新前必须重读磁盘上的 `auth.json` |
 | `raccoon-daily` | 商汤小浣熊 +300 / 延效 7 天 | launchd 3 趟 | 30 天 IAM JWT 无续期，到期人工重登 |
-| `ima-daily-signin` | 腾讯 ima 50 算力 / 日、周满签奖励 | launchd 07:10 / 21:10 **+ 本仓插件（双通道）** | 领取后 7 天有效，过期作废；两通道服务端按天幂等，重复跑不会重复到账 |
+| `ima-daily-signin` | 腾讯 ima 50 算力 / 日、周满签奖励 | **仅本仓插件（Actions 3 趟）**；本机 launchd 已于 2026-11-13 卸载，代码留作备用 | 领取后 7 天有效；refreshToken 是轮换型，收敛成单通道避免并发刷新互相作废 |
 | `doubao-daily-signin` | 豆包每日额度 + 500/2000/5000 里程碑 | launchd 07:20 / 21:20（**唯一入口**） | Cookie 由本机钥匙串解密；机房 IP 会被判会话无效，不能上云 |
 
 ---
