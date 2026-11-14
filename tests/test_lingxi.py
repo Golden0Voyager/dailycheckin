@@ -42,6 +42,35 @@ def tasks_response(status="claimed", total=100, **kwargs):
     }
 
 
+def cycle_response(day_statuses, today_day=2, top="incomplete", total=100):
+    """11-14 实测结构：顶层 status=incomplete，当日状态藏在 check_in_days 格子里。"""
+    days = [
+        {"day": i, "reward": 200 if i == 7 else 100, "status": day_statuses[i - 1]}
+        for i in range(1, 8)
+    ]
+    t = {
+        "task_key": L.TASK_KEY,
+        "reward_amount": 100,
+        "status": top,
+        "extra": {
+            "check_in_days": days,
+            "consecutive_days": today_day - 1,
+            "today_day": today_day,
+            "today_reward": 100,
+        },
+    }
+    return {
+        "result": "ok",
+        "http_status": 200,
+        "data": {"tasks": [t], "total_claimed_credits": total},
+    }
+
+
+CLAIMED_THEN_AVAILABLE = ["claimed", "available", "locked", "locked", "locked", "locked", "locked"]
+CLAIMED_THEN_CLAIMED = ["claimed", "claimed", "locked", "locked", "locked", "locked", "locked"]
+CLAIMED_THEN_LOCKED = ["claimed", "locked", "locked", "locked", "locked", "locked", "locked"]
+
+
 class Driver:
     """按 URL 分发的可控假请求，记录每一次调用。"""
 
@@ -119,6 +148,63 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(L.find_daily_task([{"task_key": "other"}]))
 
 
+# ────────────────────────── 状态归一（11-14 改版） ──────────────────────────
+class TestStatusResolution(unittest.TestCase):
+    def cell(self, resp):
+        return L.find_daily_task(resp["data"]["tasks"])
+
+    def test_top_level_status_wins(self):
+        for expected in ("claimed", "available"):
+            status, source = L.resolve_status(self.cell(tasks_response(expected)))
+            self.assertEqual(status, expected)
+            self.assertEqual(source, "顶层 status")
+
+    def test_incomplete_falls_back_to_available_cell(self):
+        resp = cycle_response(CLAIMED_THEN_AVAILABLE)
+        status, source = L.resolve_status(self.cell(resp))
+        self.assertEqual(status, "available")
+        self.assertIn("当日格子", source)
+
+    def test_incomplete_falls_back_to_claimed_cell(self):
+        resp = cycle_response(CLAIMED_THEN_CLAIMED)
+        self.assertEqual(L.resolve_status(self.cell(resp))[0], "claimed")
+
+    def test_unknown_cell_status_never_becomes_available(self):
+        resp = cycle_response(CLAIMED_THEN_LOCKED)
+        status, source = L.resolve_status(self.cell(resp))
+        self.assertEqual(status, "incomplete")
+        self.assertIn("无法确认", source)
+
+    def test_non_whitelisted_top_status_never_falls_back(self):
+        # 服务端冒出新状态时，哪怕格子是 available 也不能回退放行。
+        for top in ("suspended", "banned", "locked", "typo_status"):
+            resp = cycle_response(CLAIMED_THEN_AVAILABLE, top=top)
+            status, source = L.resolve_status(self.cell(resp))
+            self.assertEqual(status, top)
+            self.assertIn("不回退", source)
+
+    def test_missing_today_day_stays_unknown(self):
+        resp = cycle_response(CLAIMED_THEN_AVAILABLE)
+        self.cell(resp)["extra"].pop("today_day")
+        self.assertEqual(L.resolve_status(self.cell(resp))[0], "incomplete")
+
+    def test_index_fallback_when_day_field_missing(self):
+        resp = cycle_response(CLAIMED_THEN_AVAILABLE)
+        for day in self.cell(resp)["extra"]["check_in_days"]:
+            day.pop("day")
+        self.assertEqual(L.resolve_status(self.cell(resp))[0], "available")
+
+    def test_check_only_exposes_effective_status(self):
+        resp = cycle_response(CLAIMED_THEN_AVAILABLE)
+        driver = Driver(before=resp)
+        with mock.patch.object(L, "request_json", side_effect=driver):
+            out = L.Lingxi({"cookie": COOKIE}).check_only()
+        self.assertEqual(out["status"], "incomplete")
+        self.assertEqual(out["effective_status"], "available")
+        self.assertEqual(out["status_text"], "可领取")
+        self.assertEqual(driver.posts(), [])
+
+
 # ────────────────────────────── 主流程 ──────────────────────────────
 class TestMain(unittest.TestCase):
     def test_claimed_never_posts(self):
@@ -167,6 +253,46 @@ class TestMain(unittest.TestCase):
         with mock.patch.object(L, "request_json", side_effect=driver):
             with self.assertRaisesRegex(RuntimeError, "签到状态异常"):
                 L.Lingxi({"cookie": COOKIE}).main()
+        self.assertEqual(driver.posts(), [])
+
+    def test_incomplete_with_available_cell_claims_once(self):
+        before = cycle_response(CLAIMED_THEN_AVAILABLE)
+        after = cycle_response(CLAIMED_THEN_CLAIMED, total=200)
+        driver = Driver(before=before, after=after)
+        text, driver = run_main(driver)
+        self.assertEqual(len(driver.posts()), 1)
+        self.assertIn("成功 +100 智点", text)
+        self.assertIn("状态判定", text)
+        self.assertIn("到账核对", text)
+
+    def test_recheck_uses_resolved_status_not_raw_top_level(self):
+        # 回查时顶层仍是 incomplete（周期未完成），但当日格子已翻 claimed。
+        # 若回查只读顶层就会误判 UNCONFIRMED，下一趟重复 POST 反而碰风控。
+        before = cycle_response(CLAIMED_THEN_AVAILABLE)
+        after = cycle_response(CLAIMED_THEN_CLAIMED, top="incomplete", total=200)
+        driver = Driver(before=before, after=after)
+        text, driver = run_main(driver)
+        self.assertEqual(len(driver.posts()), 1)
+        self.assertIn("状态已翻转", text)
+
+    def test_incomplete_with_unknown_cell_does_not_post(self):
+        driver = Driver(before=cycle_response(CLAIMED_THEN_LOCKED))
+        with mock.patch.object(L, "request_json", side_effect=driver):
+            with self.assertRaisesRegex(RuntimeError, "签到状态异常"):
+                L.Lingxi({"cookie": COOKIE}).main()
+        self.assertEqual(driver.posts(), [])
+
+    def test_non_whitelisted_top_status_does_not_post(self):
+        driver = Driver(before=cycle_response(CLAIMED_THEN_AVAILABLE, top="suspended"))
+        with mock.patch.object(L, "request_json", side_effect=driver):
+            with self.assertRaisesRegex(RuntimeError, "签到状态异常"):
+                L.Lingxi({"cookie": COOKIE}).main()
+        self.assertEqual(driver.posts(), [])
+
+    def test_incomplete_with_claimed_cell_does_not_post(self):
+        driver = Driver(before=cycle_response(CLAIMED_THEN_CLAIMED))
+        text, driver = run_main(driver)
+        self.assertIn("今天已签到", text)
         self.assertEqual(driver.posts(), [])
 
     def test_task_panel_error_raises(self):

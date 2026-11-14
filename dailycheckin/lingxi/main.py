@@ -17,6 +17,9 @@
   连签第 3 天累计返回 300，拿它当当天战果会虚报 3 倍。当天额优先读
   ``extra.today_reward``，再退 ``reward_amount``。
 - 奖励 100 智点/天，第 7 天 200；断签会重置周期，所以「电脑没开机也跑」很重要。
+- **顶层 ``status`` 不总是 ``claimed`` / ``available``**：2026-11-14 实测服务端会返回
+  ``incomplete``（疑为「7 天周期未完成」的聚合语义），此时 ``extra.check_in_days`` 里
+  ``today_day`` 对应那一格才是准确的当日状态。见 :func:`resolve_status`。
 
 凭据是 ``wps_sid`` 为核心的 Cookie 整串，实测有效期约 364 天、接口不会自动续期。
 过期时从浏览器重新导出并更新 Secret 即可，不存在轮换问题，多通道并行是安全的。
@@ -40,6 +43,11 @@ TASK_KEY = "daily_check_in"
 STATUS_CLAIMED = "claimed"
 STATUS_AVAILABLE = "available"
 STATUS_TEXT = {STATUS_CLAIMED: "今日已签", STATUS_AVAILABLE: "可领取"}
+
+# 已知「顶层是周期聚合态、当日状态要看格子」的取值白名单。
+# 只放实测确认过的别名：服务端若冒出 suspended / banned 之类新状态，
+# 一律保守拒绝，绝不因为格子恰好是 available 就误发 POST。
+AGGREGATE_STATUSES = ("incomplete",)
 
 CST = timezone(timedelta(hours=8))
 CODE_TRANSIENT = -1  # 网络异常 / 空响应 / 非 JSON，归一化码
@@ -112,6 +120,51 @@ def find_daily_task(tasks):
         if isinstance(task, dict) and task.get("task_key") == TASK_KEY:
             return task
     return None
+
+
+def resolve_status(task):
+    """归一当日签到状态，返回 ``(status, source)``。
+
+    服务端 2026-11-14 起会把顶层 ``status`` 返回成 ``incomplete`` —— 这是
+    「7 天周期未完成」的聚合语义，不代表当日不可领。真正准确的当日状态在
+    ``extra.check_in_days`` 里 ``extra.today_day`` 对应的那一格。
+
+    判定优先级（幂等边界不变，只有明确 ``available`` 才允许 POST）：
+
+    1. 顶层是 ``claimed`` / ``available`` → 直接采信，历史行为不变。
+    2. 顶层是 :data:`AGGREGATE_STATUSES` 里的已知聚合态 → 回退到当日格子；
+       格子明确 ``available`` / ``claimed`` 才采信。
+    3. 顶层是其它未知值（``suspended`` / ``banned`` / 拼错……）→ **不回退**，
+       原样返回，交给调用方保守拒绝。宁可漏签也不碰风控。
+    4. 格子缺失、``today_day`` 缺失或格子状态也是未知值 → 原样返回顶层未知值。
+
+    ``source`` 只用于日志说明判定依据，不参与判定。
+    """
+    top = task.get("status")
+    if top in (STATUS_CLAIMED, STATUS_AVAILABLE):
+        return top, "顶层 status"
+    if top not in AGGREGATE_STATUSES:
+        return top, "未知顶层状态（非白名单，不回退）"
+
+    extra = task.get("extra") or {}
+    today_day = extra.get("today_day")
+    days = extra.get("check_in_days") or []
+    cell = None
+    if isinstance(today_day, int) and not isinstance(today_day, bool):
+        for day in days:
+            if isinstance(day, dict) and day.get("day") == today_day:
+                cell = day
+                break
+        if cell is None and 1 <= today_day <= len(days):
+            candidate = days[today_day - 1]
+            if isinstance(candidate, dict):
+                cell = candidate
+
+    if cell:
+        cell_status = cell.get("status")
+        if cell_status in (STATUS_CLAIMED, STATUS_AVAILABLE):
+            return cell_status, f"当日格子（today_day={today_day}）"
+    return top, "未知状态（顶层与当日格子均无法确认）"
 
 
 def today_reward(task):
@@ -199,9 +252,12 @@ class Lingxi(CheckIn):
         cookie = self._cookie()
         task, data = self._tasks(cookie)
         extra = task.get("extra") or {}
+        effective, source = resolve_status(task)
         return {
             "status": task.get("status"),
-            "status_text": STATUS_TEXT.get(task.get("status"), "未知"),
+            "effective_status": effective,
+            "status_source": source,
+            "status_text": STATUS_TEXT.get(effective, "未知"),
             "today_reward": today_reward(task),
             "consecutive_days": extra.get("consecutive_days"),
             "today_day": extra.get("today_day"),
@@ -213,9 +269,13 @@ class Lingxi(CheckIn):
     def main(self):
         cookie = self._cookie()
         task, data = self._tasks(cookie)
-        status = task.get("status")
+        status, source = resolve_status(task)
         reward = today_reward(task)
         lines = []
+
+        # 顶层是未知值时才需要说明回退依据，正常路径不往 Bark 里加噪声。
+        if source != "顶层 status":
+            lines.append(f"状态判定：顶层 {task.get('status')} → 按{source}取 {status}")
 
         if status == STATUS_CLAIMED:
             lines.append("每日签到：今天已签到")
@@ -236,10 +296,13 @@ class Lingxi(CheckIn):
             lines.append(f"每日签到：成功 +{reward} 智点")
 
             # 回查：领取返回 ok 不代表状态真的翻转，必须重拉面板确认。
+            # 顶层可能仍是 incomplete（周期未完成），所以回查同样走 resolve_status，
+            # 否则会误判 UNCONFIRMED，下一趟重复 POST 反而碰风控。
             task, data = self._tasks(cookie)
-            if task.get("status") != STATUS_CLAIMED:
+            confirmed, confirmed_source = resolve_status(task)
+            if confirmed != STATUS_CLAIMED:
                 raise RuntimeError("签到已受理但状态未翻转为 claimed（UNCONFIRMED），请人工核对，勿连续重跑")
-            lines.append("到账核对：状态已翻转为已签到")
+            lines.append(f"到账核对：状态已翻转为已签到（依据{confirmed_source}）")
         else:
             raise RuntimeError(f"签到状态异常（status={status}），为避免碰风控，本趟不发起领取")
 
