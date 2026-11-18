@@ -91,7 +91,9 @@ class SMZDM(CheckIn):
             rewardurl = f"https://zhiyou.smzdm.com/user/lottery/jsonp_get_active_info?active_id={active_id}"
             infourl = "https://zhiyou.smzdm.com/user/"
             headers = {
-                "Host": "zhiyou.smzdm.com",
+                # 不要固定 Host：zhiyou.smzdm.com/user/ 会被 302 到 www.smzdm.com，
+                # requests 跟随重定向时不会更新自定义 Host 头，导致 www 端反复返回
+                # 同一 302，死循环 30 次抛 "Exceeded 30 redirects."。让 requests 自动填。
                 "Accept": "*/*",
                 "Connection": "keep-alive",
                 "Cookie": cookie,
