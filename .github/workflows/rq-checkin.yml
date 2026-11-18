@@ -1,0 +1,80 @@
+name: RQ Check-in
+
+# RQrun（RQ 跑力）每日签到 —— 2026-11-18 由独立仓库 rq-checkin（已删除）合并进本仓。
+# 凭据：Secrets.RQ_COOKIE = RQWEBSESSID=<值>，从浏览器登录 www.rq.run 后取。
+# 验证码：ddddocr 本地识别，纯 Python，无需人工干预。
+# 依赖独立于主签到：requirements-rq.txt，不与 dailycheckin 主 workflow 混装。
+
+on:
+  schedule:
+    # GitHub cron 按 UTC 解释。北京时间 = UTC+8。
+    # 排 4 个槽位把「当天兜底」交给 cron，而不是依赖本机自动化来补跑。
+    # 已签到的运行会直接返回 status=10009，不触发 OCR、不碰登录风控，成本≈1 分钟。
+    - cron: "10 0 * * *"   # 08:10 北京时间，主跑
+    - cron: "10 4 * * *"   # 12:10 北京时间，上午失手时补
+    - cron: "10 12 * * *"  # 20:10 北京时间，晚兜底
+    - cron: "10 15 * * *"  # 23:10 北京时间，睡前最后一兜
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rq-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # opencv-python（ddddocr 的依赖）在无桌面环境需要这两个 so
+      - name: Install OCR system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-rq.txt
+
+      - name: Check in
+        env:
+          RQ_COOKIE: ${{ secrets.RQ_COOKIE }}
+        run: |
+          if [ -z "${RQ_COOKIE:-}" ]; then
+            echo "::error::缺少 Secret RQ_COOKIE（格式：RQWEBSESSID=xxxx）"
+            exit 2
+          fi
+          # 注意：不用 --from-chrome，Actions 上没有 Chrome；走 RQ_COOKIE 注入
+          # 仓库已公开，输出里把昵称抹掉（只影响展示，不影响签到判断）
+          set +e
+          python rq_checkin.py --json 2>&1 \
+            | sed -E 's/("nickname"[[:space:]]*:[[:space:]]*")[^"]*/\1***/g' \
+            | tee rq.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          case "$rc" in
+            0) echo "::notice::签到完成（本次新签或今日已签，均为正常）" ;;
+            2) echo "::error::凭据缺失或格式错误" ;;
+            3) echo "::error::RQ 会话已失效（RQWEBSESSID 过期）—— 需在浏览器重新登录 https://www.rq.run/Home/Login/login.html 后，把新的 RQWEBSESSID 更新到 Secret RQ_COOKIE" ;;
+            4) echo "::error::签到失败，详见上方日志" ;;
+            5) echo "::error::触发 RQ 登录风控（错误次数过多）—— 不要连续重试，等 5 分钟以上或改天再跑" ;;
+            *) echo "::error::未知退出码 $rc" ;;
+          esac
+          exit "$rc"
+
+      - name: Wipe run artifacts
+        if: always()
+        run: rm -f rq.log config.json .rq_state.json
