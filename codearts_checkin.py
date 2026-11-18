@@ -297,21 +297,44 @@ def main():
     ap = argparse.ArgumentParser(description="华为云 CodeArts 每日签到（AK/SK 签名）")
     ap.add_argument("--dry-run", action="store_true", help="只读：查资格与活动状态，不领取")
     ap.add_argument("--status", action="store_true", help="只读：查凭据有效期与账户信息")
+    ap.add_argument("--json", action="store_true", help="输出单行 JSON 日志（供 launchd / 巡检判读）")
     args = ap.parse_args()
+
+    def emit(obj):
+        """统一输出：--json 给巡检看；默认给人类看。"""
+        if args.json:
+            print(json.dumps(obj, ensure_ascii=False))
+        else:
+            print("CODEARTS_RESULT: " + json.dumps(obj, ensure_ascii=False))
+
+    def fail(code, msg, result, need_attention=True):
+        """--json 模式下错误也输出结构化单行，供巡检 needs_attention 判读。"""
+        if args.json:
+            emit({
+                "time": dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M"),
+                "provider": "codearts", "result": result, "needs_attention": need_attention,
+                "points": 0, "token_days_left": None, "report": msg,
+            })
+        else:
+            print(f"CODEARTS_FAIL: {msg}", file=sys.stderr)
+        sys.exit(code)
 
     try:
         cred = load_credential()
     except CodeArtsError as e:
-        print(f"CODEARTS_FAIL: {e}", file=sys.stderr)
-        sys.exit(4)
+        fail(4, str(e), "ERROR")
     if not cred:
-        print("CODEARTS_FAIL: 未找到凭据。本机跑 codearts_auth.py 授权；Actions 需设 Secret CODEARTS_CREDENTIAL", file=sys.stderr)
-        sys.exit(2)
+        fail(2, "未找到凭据，请本机跑 codearts_auth.py 授权", "NEED_RELOGIN")
+    if not args.json:
+        # 人类可读提示走 stderr，避免污染 JSON 日志
+        pass
 
     days = expires_in_days(cred)
     if days is not None and days < 0:
-        print(f"CODEARTS_TOKEN_EXPIRED: 凭据已于 {abs(days):.1f} 天前过期，需本机重新浏览器授权", file=sys.stderr)
-        sys.exit(3)
+        fail(3, f"凭据已于 {abs(days):.1f} 天前过期，需本机重新浏览器授权", "NEED_RELOGIN")
+    if days is not None and 0 <= days <= 2:
+        # 快过期仍尝试签，但巡检要提醒重授权（needs_attention 由 result 决定，warning 带出）
+        pass
 
     try:
         if args.status:
@@ -329,24 +352,48 @@ def main():
                 "signed_today": bool(daily) and not any(a["claimable"] for a in daily),
             }
             if days is not None and 0 <= days <= 3:
-                status_out["warning"] = f"凭据还剩 {days:.1f} 天过期，尽快本机重新授权并更新 Secret"
+                status_out["warning"] = f"凭据还剩 {days:.1f} 天过期，请本机重新授权"
             print(json.dumps(status_out, ensure_ascii=False))
             return
         result = do_checkin(cred, dry_run=args.dry_run)
     except CodeArtsError as e:
         if TOKEN_EXPIRED_RE.search(str(e)):
-            print(f"CODEARTS_TOKEN_EXPIRED: 华为云临时凭据已失效，需本机重新浏览器授权（{e}）", file=sys.stderr)
-            sys.exit(3)
-        print(f"CODEARTS_FAIL: [{e.code}] {e}", file=sys.stderr)
-        sys.exit(4)
+            fail(3, f"华为云临时凭据已失效，请本机重新浏览器授权（{e}）", "NEED_RELOGIN")
+        fail(4, f"[{e.code}] {e}", "ERROR")
 
-    out = {"state": result["state"]}
-    if result["state"] == "signed":
+    state = result["state"]
+    # 活动到期下线（无 USER_LOGIN）属正常，不算异常
+    if state == "inactive" and "未找到每日签到活动" in result.get("message", ""):
+        result_map, attention = "NO_TASK", False
+    elif state == "inactive":
+        result_map, attention = "ERROR", True
+    elif state == "already":
+        result_map, attention = "ALREADY", False
+    elif state == "signed":
+        result_map, attention = "CLAIMED", False
+    else:  # dry
+        result_map, attention = "DRY", False
+
+    if args.json:
+        out = {
+            "time": dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M"),
+            "provider": "codearts", "result": result_map, "needs_attention": attention,
+            "points": result.get("credit", 0),
+            "token_days_left": None if days is None else round(days, 1),
+            "report": result.get("message") or ("签到成功" if state == "signed" else state),
+        }
+        if days is not None and 0 <= days <= 2:
+            out["warning"] = f"凭据还剩 {days:.1f} 天过期，请重新授权"
+        emit(out)
+        return
+
+    out = {"state": state}
+    if state == "signed":
         out["credit"] = result["credit"]
         out["message"] = f"签到成功，+{result['credit']} 积分"
-    elif result["state"] == "already":
+    elif state == "already":
         out["message"] = "今日已签到"
-    elif result["state"] == "dry":
+    elif state == "dry":
         act = result["activity"]
         out.update({
             "claimable": act["claimable"],
@@ -359,8 +406,8 @@ def main():
         out["message"] = result.get("message", "无签到活动")
     out["remaining_credit"] = result["info"]["remaining"]
     if days is not None and 0 <= days <= 7:
-        out["warning"] = f"凭据还剩 {days:.1f} 天过期，尽快本机重新授权"
-    print("CODEARTS_RESULT: " + json.dumps(out, ensure_ascii=False))
+        out["warning"] = f"凭据还剩 {days:.1f} 天过期，请本机重新授权"
+    emit(out)
 
 
 if __name__ == "__main__":
