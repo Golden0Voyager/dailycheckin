@@ -1,0 +1,66 @@
+name: CodeArts Check-in
+
+# 华为云 CodeArts（码道）每日签到 —— AK/SK 签名直连网关，不用浏览器 Cookie。
+# 凭据：Secrets.CODEARTS_CREDENTIAL = 本机 codearts_auth.py 生成的凭据 JSON（单行）。
+# security_token 是 STS 临时凭据，会过期；过期后需在本机重跑 codearts_auth.py 并更新 Secret。
+# 依赖独立于主签到：requirements-codearts.txt（只有 requests）。
+
+on:
+  schedule:
+    # GitHub cron 按 UTC 解释。北京时间 = UTC+8。与主签到(16:23/00:30/04:30)错开。
+    - cron: "23 17 * * *"   # 01:23 北京时间（次日凌晨补签昨日遗漏）
+    - cron: "23 1 * * *"    # 09:23 北京时间，早间主跑
+    - cron: "23 5 * * *"    # 13:23 北京时间，午后兜底
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codearts-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-codearts.txt
+
+      - name: Check in
+        env:
+          CODEARTS_CREDENTIAL: ${{ secrets.CODEARTS_CREDENTIAL }}
+        run: |
+          if [ -z "${CODEARTS_CREDENTIAL:-}" ]; then
+            echo "::error::缺少 Secret CODEARTS_CREDENTIAL —— 需本机跑 codearts_auth.py 授权，把 ~/.codearts/credentials.json 内容设为 Secret"
+            exit 2
+          fi
+          set +e
+          python codearts_checkin.py 2>&1 | tee codearts.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          case "$rc" in
+            0) echo "::notice::签到完成或今日已签（均为正常）" ;;
+            2) echo "::error::凭据缺失 —— 需设 Secret CODEARTS_CREDENTIAL" ;;
+            3) echo "::error::华为云临时凭据已过期 —— 需本机重跑 codearts_auth.py 授权后更新 Secret CODEARTS_CREDENTIAL" ;;
+            4) echo "::error::签到失败，详见上方 CODEARTS_FAIL 日志" ;;
+            *) echo "::error::未知退出码 $rc" ;;
+          esac
+          exit "$rc"
+
+      - name: Wipe run artifacts
+        if: always()
+        run: rm -f codearts.log
